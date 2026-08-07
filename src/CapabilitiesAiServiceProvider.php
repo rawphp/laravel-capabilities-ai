@@ -13,13 +13,16 @@ use Rawphp\CapabilitiesAi\Contracts\IdempotencyReadiness;
 use Rawphp\CapabilitiesAi\Contracts\LlmClient;
 use Rawphp\CapabilitiesAi\Contracts\ProgressStore;
 use Rawphp\CapabilitiesAi\Contracts\ToolCatalog;
+use Rawphp\CapabilitiesAi\Console\ReapStaleTurnsCommand;
 use Rawphp\CapabilitiesAi\Domain\ConversationService;
 use Rawphp\CapabilitiesAi\Domain\ProposalService;
+use Rawphp\CapabilitiesAi\Domain\StaleTurnReaper;
 use Rawphp\CapabilitiesAi\Domain\TurnClaim;
 use Rawphp\CapabilitiesAi\Domain\TurnRunner;
 use Rawphp\CapabilitiesAi\Domain\TurnService;
-use Rawphp\CapabilitiesAi\Support\AlwaysReadyIdempotency;
+use Rawphp\Capabilities\Contracts\IdempotencyStore;
 use Rawphp\CapabilitiesAi\Support\ContainerBindings;
+use Rawphp\CapabilitiesAi\Support\StoreBoundIdempotencyReadiness;
 use RuntimeException;
 
 /**
@@ -45,6 +48,8 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
         $this->bootRoutes();
 
         if ($this->app->runningInConsole()) {
+            $this->commands([ReapStaleTurnsCommand::class]);
+
             $this->publishes([
                 __DIR__.'/../config/capabilities-ai.php' => config_path('capabilities-ai.php'),
             ], 'capabilities-ai-config');
@@ -59,13 +64,27 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
     {
         if (! $this->app->bound(LlmClient::class)) {
             $this->app->singleton(LlmClient::class, function (Container $app) {
-                return ContainerBindings::makeLlmClient(self::configFromApp($app));
+                $config = self::configFromApp($app);
+                // Host-prebound LlmClient skips this factory entirely (bound() guard above).
+                ContainerBindings::assertSafeDrivers(
+                    $config,
+                    self::isTestingEnvironment($app),
+                    self::allowUnsafeDrivers($config),
+                );
+
+                return ContainerBindings::makeLlmClient($config);
             });
         }
 
         if (! $this->app->bound(ProgressStore::class)) {
             $this->app->singleton(ProgressStore::class, function (Container $app) {
                 $config = self::configFromApp($app);
+                // Host-prebound ProgressStore skips this factory entirely (bound() guard above).
+                ContainerBindings::assertSafeDrivers(
+                    $config,
+                    self::isTestingEnvironment($app),
+                    self::allowUnsafeDrivers($config),
+                );
                 $redis = self::resolveRedisClientOrNull($app, $config);
 
                 return ContainerBindings::makeProgressStore($config, $redis);
@@ -73,6 +92,8 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
         }
 
         $this->app->singleton(TurnClaim::class, static fn () => new TurnClaim);
+
+        $this->app->singleton(StaleTurnReaper::class, static fn () => new StaleTurnReaper);
 
         $this->app->singleton(TurnService::class, function (Container $app) {
             return ContainerBindings::makeTurnService($app->make(ProgressStore::class));
@@ -93,8 +114,16 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
         });
 
         if (! $this->app->bound(IdempotencyReadiness::class)) {
-            // Default proven-ready; host rebinds a live probe that is evaluated at accept time.
-            $this->app->singleton(IdempotencyReadiness::class, static fn () => new AlwaysReadyIdempotency);
+            // Live probe of core IdempotencyStore; fail closed when unbound. AlwaysReady is tests-only.
+            $this->app->singleton(IdempotencyReadiness::class, function (Container $app) {
+                if ($app->bound(IdempotencyStore::class)) {
+                    return StoreBoundIdempotencyReadiness::forStore(
+                        $app->make(IdempotencyStore::class)
+                    );
+                }
+
+                return StoreBoundIdempotencyReadiness::unbound();
+            });
         }
 
         $this->app->singleton(ConversationService::class, function (Container $app) {
@@ -104,6 +133,7 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
                 self::makeDispatchCallable($app),
                 $app->make(ProgressStore::class),
                 ContainerBindings::claimTtlFromConfig($config),
+                $config,
             );
         });
 
@@ -130,16 +160,35 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
      */
     private static function makeDispatchCallable(Container $app): callable
     {
+        $config = self::configFromApp($app);
+        $queueName = $config['queue']['name'] ?? null;
+        $queueConnection = $config['queue']['connection'] ?? null;
+        $queueName = is_string($queueName) && $queueName !== '' ? $queueName : null;
+        $queueConnection = is_string($queueConnection) && $queueConnection !== '' ? $queueConnection : null;
+
+        $applyQueue = static function (object $job) use ($queueName, $queueConnection): void {
+            if ($queueName !== null && property_exists($job, 'queue')) {
+                $job->queue = $queueName;
+            }
+            if ($queueConnection !== null && property_exists($job, 'connection')) {
+                $job->connection = $queueConnection;
+            }
+        };
+
         if ($app->bound('Illuminate\Contracts\Bus\Dispatcher')) {
             $bus = $app->make('Illuminate\Contracts\Bus\Dispatcher');
 
-            return static function (object $job) use ($bus): mixed {
+            return static function (object $job) use ($bus, $applyQueue): mixed {
+                $applyQueue($job);
+
                 return $bus->dispatch($job);
             };
         }
 
         if (function_exists('dispatch')) {
-            return static function (object $job): mixed {
+            return static function (object $job) use ($applyQueue): mixed {
+                $applyQueue($job);
+
                 return dispatch($job);
             };
         }
@@ -210,18 +259,79 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
         return require __DIR__.'/../config/capabilities-ai.php';
     }
 
+    /**
+     * Detect testing: app()->environment('testing') when available; else APP_ENV.
+     */
+    private static function isTestingEnvironment(Container $app): bool
+    {
+        if (method_exists($app, 'environment')) {
+            /** @var string|bool $result */
+            $result = $app->environment('testing');
+
+            return $result === true || $result === 'testing';
+        }
+
+        $env = $_ENV['APP_ENV'] ?? $_SERVER['APP_ENV'] ?? getenv('APP_ENV');
+
+        return $env === 'testing';
+    }
+
+    /**
+     * Escape hatch for local demos: CAPABILITIES_AI_ALLOW_UNSAFE=1.
+     * Default closed — never the production happy path.
+     *
+     * @param  array<string, mixed>  $config  capabilities-ai config slice
+     */
+    private static function allowUnsafeDrivers(array $config): bool
+    {
+        if (! empty($config['allow_unsafe'])) {
+            return true;
+        }
+
+        $value = $_ENV['CAPABILITIES_AI_ALLOW_UNSAFE']
+            ?? $_SERVER['CAPABILITIES_AI_ALLOW_UNSAFE']
+            ?? getenv('CAPABILITIES_AI_ALLOW_UNSAFE');
+
+        if ($value === false || $value === null || $value === '') {
+            return false;
+        }
+
+        return match (strtolower((string) $value)) {
+            '1', 'true', '(true)', 'yes', 'on' => true,
+            default => false,
+        };
+    }
+
     private function bootRoutes(): void
     {
-        $config = $this->app->make('config')->get('capabilities-ai.routes', []);
-        if (! ($config['enabled'] ?? false)) {
+        $full = $this->app->make('config')->get('capabilities-ai', []);
+        $full = is_array($full) ? $full : [];
+        $routes = $full['routes'] ?? [];
+        if (! is_array($routes) || ! ($routes['enabled'] ?? false)) {
             return;
         }
 
-        $prefix = (string) ($config['prefix'] ?? 'capabilities-ai/chat');
-        $middleware = $config['middleware'] ?? ['api', 'auth:sanctum'];
+        $prefix = (string) ($routes['prefix'] ?? 'capabilities-ai/chat');
+        $middleware = $routes['middleware'] ?? ['api', 'auth:sanctum'];
+        $proposalsOn = self::proposalsEnabled($full);
 
         Route::middleware($middleware)
             ->prefix($prefix)
-            ->group(__DIR__.'/../routes/capabilities-ai.php');
+            ->group(function () use ($proposalsOn): void {
+                require __DIR__.'/../routes/capabilities-ai.php';
+                if ($proposalsOn) {
+                    require __DIR__.'/../routes/capabilities-ai-proposals.php';
+                }
+            });
+    }
+
+    /**
+     * Single gate for proposal routes, TurnRunner fence, and history (D-024).
+     *
+     * @param  array<string, mixed>  $config  capabilities-ai config slice
+     */
+    public static function proposalsEnabled(array $config): bool
+    {
+        return (bool) ($config['proposals']['enabled'] ?? true);
     }
 }

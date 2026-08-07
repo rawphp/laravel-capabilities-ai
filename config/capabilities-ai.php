@@ -37,6 +37,9 @@ return [
     /**
      * Progress store: array (tests/default) | redis
      * Never store progress events in product MySQL tables.
+     *
+     * Outside APP_ENV=testing, progress.driver=array throws unless
+     * CAPABILITIES_AI_ALLOW_UNSAFE=1 (local demos only — not production).
      */
     'progress' => [
         'driver' => $env('CAPABILITIES_AI_PROGRESS_DRIVER', 'array'),
@@ -46,6 +49,9 @@ return [
 
     /**
      * LLM driver: fake (testing) | anthropic | (host custom binding)
+     *
+     * Outside APP_ENV=testing, llm.driver=fake throws unless
+     * CAPABILITIES_AI_ALLOW_UNSAFE=1 (local demos only — not production).
      */
     'llm' => [
         'driver' => $env('CAPABILITIES_AI_LLM_DRIVER', 'fake'),
@@ -58,8 +64,41 @@ return [
         ],
     ],
 
+    /**
+     * Escape hatch: allow progress.driver=array and llm.driver=fake outside testing.
+     * CAPABILITIES_AI_ALLOW_UNSAFE=1 for local demos only. Default closed (false).
+     * Prefer redis progress + real LlmClient (or host binding) in any real deploy.
+     */
+    'allow_unsafe' => (bool) $env('CAPABILITIES_AI_ALLOW_UNSAFE', false),
+
     /** Turn claim TTL seconds (worker heartbeat window). */
     'claim_ttl' => (int) $env('CAPABILITIES_AI_CLAIM_TTL', Package::DEFAULT_CLAIM_TTL),
+
+    /**
+     * Default RunTurnJob queue routing (happy path — no ConversationService rebind).
+     * Empty/null → Laravel default queue/connection.
+     */
+    'queue' => [
+        'connection' => $env('CAPABILITIES_AI_QUEUE_CONNECTION'),
+        'name' => $env('CAPABILITIES_AI_QUEUE_NAME'),
+    ],
+
+    /**
+     * Single gate for proposal accept/reject routes, TurnRunner fence extract, and history.
+     * Phase 1 BC default true; greenfield docs: CAPABILITIES_AI_PROPOSALS_ENABLED=false.
+     */
+    'proposals' => [
+        'enabled' => (bool) $env('CAPABILITIES_AI_PROPOSALS_ENABLED', true),
+    ],
+
+    /**
+     * Stale-turn reaper thresholds for capabilities-ai:reap-stale-turns.
+     * Host schedules the command — package does not auto-schedule (D-024).
+     */
+    'reaper' => [
+        'stale_queued_minutes' => (int) $env('CAPABILITIES_AI_REAPER_STALE_QUEUED', 30),
+        'stale_running_grace_seconds' => (int) $env('CAPABILITIES_AI_REAPER_RUNNING_GRACE', 60),
+    ],
 
     /** Max tool-call rounds per turn before force-complete/fail. */
     'max_tool_rounds' => (int) $env('CAPABILITIES_AI_MAX_TOOL_ROUNDS', 8),
