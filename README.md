@@ -58,7 +58,6 @@ Key defaults (`config/capabilities-ai.php`):
 | `llm.driver` | `fake` (set `CAPABILITIES_AI_LLM_DRIVER=anthropic` or bind `LlmClient` for production) — `fake` outside testing throws unless `CAPABILITIES_AI_ALLOW_UNSAFE=1` |
 | `llm.anthropic.model` | `claude-sonnet-4-6` (`CAPABILITIES_AI_ANTHROPIC_MODEL`) |
 | `llm.anthropic.max_tokens` | `64000` (`CAPABILITIES_AI_ANTHROPIC_MAX_TOKENS`) |
-| `llm.anthropic.max_retries` | `2` (`CAPABILITIES_AI_ANTHROPIC_MAX_RETRIES`) — Anthropic 429 retries per request; waits `Retry-After` seconds (capped at 60) or 1s, 2s, 4s…; `0` disables |
 | `user_model` | null → falls back to `auth.providers.users.model` (`CAPABILITIES_AI_USER_MODEL`) |
 | `claim_ttl` | **`120`** (seconds; worker heartbeat / job timeout window) |
 | `queue.connection` | null (`CAPABILITIES_AI_QUEUE_CONNECTION`) — applied to default `RunTurnJob` dispatch when set |
@@ -67,13 +66,12 @@ Key defaults (`config/capabilities-ai.php`):
 | `reaper.stale_queued_minutes` | `30` (`CAPABILITIES_AI_REAPER_STALE_QUEUED`) |
 | `reaper.stale_running_grace_seconds` | `60` (`CAPABILITIES_AI_REAPER_RUNNING_GRACE`) |
 | `allow_unsafe` | `false` (`CAPABILITIES_AI_ALLOW_UNSAFE`) — local demos only |
-| `max_concurrent_turns` | `0` = unlimited (`CAPABILITIES_AI_MAX_CONCURRENT_TURNS`) — at the ceiling of queued + running turns, message create returns **429** `outcome: retryable` and persists/dispatches nothing |
 | `max_tool_rounds` | `8` |
 | `routes.enabled` | `false` |
 
 Progress events live in array/Redis — **not** MySQL product tables.
 
-**Bus principal (tool + accept invokes):** `TurnRunner` and `ProposalService` resolve the conversation’s Laravel user via `user_model` / auth provider and pass `caller=job` plus that user as `actor` on `CapabilityBus::invoke`. Missing/unresolvable `conversation.user_id` fails closed (no silent default user). When `CapabilityBus` is bound, provider boot also fails closed if the user model is unset, missing, or has no `query()` (class check only, no DB). README “bare” tool invokes means **no `idempotency_key`** — not “no invoke options.”
+**Bus principal (tool + accept invokes):** `TurnRunner` and `ProposalService` resolve the conversation’s Laravel user via `user_model` / auth provider and pass `caller=job` plus that user as `actor` on `CapabilityBus::invoke`. Missing/unresolvable `conversation.user_id` fails closed (no silent default user). README “bare” tool invokes means **no `idempotency_key`** — not “no invoke options.”
 
 ### Host integration (D-024 seams)
 
@@ -120,7 +118,7 @@ $app->bind(LlmClient::class, fn () => new AnthropicLlmClient(
 
 **Proposals (single accept/reject model):** Gated by **`proposals.enabled`** (`CAPABILITIES_AI_PROPOSALS_ENABLED`). When **false**: accept/reject routes are not registered, TurnRunner **skips** fence → proposal extract, and history omits/empties proposals. When **true**: Accept returns typed `AcceptOutcome` for every known status (rejected/expired → `refuse`); HTTP maps outcomes + 404 when missing. Reject uses CAS + RuntimeException → 409 for non-pending. **Greenfield:** set `false` until you need proposals. **Host upgrade callouts:** [user guide](docs/user-guide.md#upgrade-for-hosts-acceptreject-wire) · [CHANGELOG Breaking](CHANGELOG.md).
 
-- **Accept:** atomic CAS `pending → accepting`, then `target_capability` must be in the host `ToolCatalog` list for the proposal's turn (D-008; checked on every execute, no catalog bound → refuse) or the proposal fails with **403** `capability_not_in_profile` and no invoke; then bus invoke with `idempotency_key=proposal:{ulid}` (D-005). Live **`StoreBoundIdempotencyReadiness`** probe of core `IdempotencyStore` (fail closed when unbound) — not a constructor stamp; **`AlwaysReadyIdempotency` is unit-tests only**. Branch `isApprovalRequired()` then `isHardRefuse()` then `isRetryable()`; approval/retry leave status `accepting` for host re-drive. Hard non-retryable → `failed` + `last_error`. Success → atomic `accepting → accepted`, clear `last_error`. Returns typed `AcceptOutcome` (`accepted` | `approval_required` | `retryable` | `failed` | `refuse`).
+- **Accept:** atomic CAS `pending → accepting`, then bus invoke with `idempotency_key=proposal:{ulid}` (D-005). Live **`StoreBoundIdempotencyReadiness`** probe of core `IdempotencyStore` (fail closed when unbound) — not a constructor stamp; **`AlwaysReadyIdempotency` is unit-tests only**. Branch `isApprovalRequired()` then `isHardRefuse()` then `isRetryable()`; approval/retry leave status `accepting` for host re-drive. Hard non-retryable → `failed` + `last_error`. Success → atomic `accepting → accepted`, clear `last_error`. Returns typed `AcceptOutcome` (`accepted` | `approval_required` | `retryable` | `failed` | `refuse`).
 - **Reject:** atomic CAS `pending → rejected` only; already-rejected is idempotent; accepting/accepted/failed/expired refuse (HTTP 409).
 - **Recovery:** stuck `accepting` is intentional (approval / retry / crash mid-accept). Package does **not** TTL-expire or reclaim; host re-drives accept under the same D-005 key (`proposal:{ulid}`). Hosts must wire core **`IdempotencyStore`** (not an AI-package store) so the bus actually dedupes; readiness not ready → 503 without invoke. Conversation/tool bus invokes stay without an `idempotency_key` — only accept sets the proposal key. Both tool and accept invokes still carry the job+user principal (above).
 - **Stale turns:** schedule `php artisan capabilities-ai:reap-stale-turns` (host owns the schedule; package does not auto-schedule). Thresholds: `reaper.stale_queued_minutes`, `reaper.stale_running_grace_seconds` (running age uses max(`claim_ttl`, grace)).

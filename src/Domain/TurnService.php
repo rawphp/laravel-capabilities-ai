@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Rawphp\CapabilitiesAi\Domain;
 
-use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Carbon;
 use Rawphp\CapabilitiesAi\Contracts\ProgressStore;
@@ -15,8 +14,6 @@ use RuntimeException;
 
 /**
  * Turn query + cancel + progress events for HTTP adapters.
- *
- * Every lookup is scoped to the conversation owner: another owner's turn is not found.
  */
 final class TurnService
 {
@@ -35,9 +32,12 @@ final class TurnService
      *     finished_at: ?string
      * }
      */
-    public function show(string $turnUlid, string $ownerId): array
+    public function show(string $turnUlid): array
     {
-        $turn = $this->owned($turnUlid, $ownerId)->with('conversation')->firstOrFail();
+        $turn = Turn::query()->where('ulid', $turnUlid)->with('conversation')->first();
+        if ($turn === null) {
+            throw (new ModelNotFoundException)->setModel(Turn::class, [$turnUlid]);
+        }
 
         return [
             'turn_ulid' => $turn->ulid,
@@ -59,9 +59,12 @@ final class TurnService
      *
      * @return array{turn_ulid: string, status: string}
      */
-    public function cancel(string $turnUlid, string $ownerId): array
+    public function cancel(string $turnUlid): array
     {
-        $turn = $this->owned($turnUlid, $ownerId)->firstOrFail();
+        $turn = Turn::query()->where('ulid', $turnUlid)->first();
+        if ($turn === null) {
+            throw (new ModelNotFoundException)->setModel(Turn::class, [$turnUlid]);
+        }
 
         if ($turn->status === Turn::STATUS_CANCELLED) {
             return ['turn_ulid' => $turn->ulid, 'status' => Turn::STATUS_CANCELLED];
@@ -113,22 +116,13 @@ final class TurnService
     /**
      * @return list<array{kind: string, data?: mixed, at?: string, index: int}>
      */
-    public function events(string $turnUlid, string $ownerId, int $cursor = 0): array
+    public function events(string $turnUlid, int $cursor = 0): array
     {
-        if (! $this->owned($turnUlid, $ownerId)->exists()) {
+        $exists = Turn::query()->where('ulid', $turnUlid)->exists();
+        if (! $exists) {
             throw (new ModelNotFoundException)->setModel(Turn::class, [$turnUlid]);
         }
 
         return $this->progress->since($turnUlid, $cursor);
-    }
-
-    /**
-     * @return Builder<Turn>
-     */
-    private function owned(string $turnUlid, string $ownerId): Builder
-    {
-        return Turn::query()
-            ->where('ulid', $turnUlid)
-            ->whereHas('conversation', static fn (Builder $q) => $q->where('user_id', $ownerId));
     }
 }
