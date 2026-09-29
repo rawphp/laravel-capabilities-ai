@@ -9,6 +9,8 @@ use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Rawphp\Capabilities\Contracts\CapabilityBus;
 use Rawphp\Capabilities\Contracts\IdempotencyStore;
+use Rawphp\Capabilities\Contracts\Metrics;
+use Rawphp\Capabilities\Contracts\Tracer;
 use Rawphp\CapabilitiesAi\Console\ReapStaleTurnsCommand;
 use Rawphp\CapabilitiesAi\Contracts\ConversationContextProvider;
 use Rawphp\CapabilitiesAi\Contracts\IdempotencyReadiness;
@@ -22,6 +24,7 @@ use Rawphp\CapabilitiesAi\Domain\TurnClaim;
 use Rawphp\CapabilitiesAi\Domain\TurnRunner;
 use Rawphp\CapabilitiesAi\Domain\TurnService;
 use Rawphp\CapabilitiesAi\Support\ContainerBindings;
+use Rawphp\CapabilitiesAi\Support\ResolveConversationActor;
 use Rawphp\CapabilitiesAi\Support\StoreBoundIdempotencyReadiness;
 use RuntimeException;
 
@@ -45,6 +48,7 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        $this->assertConversationActorModel();
         $this->bootRoutes();
 
         if ($this->app->runningInConsole()) {
@@ -72,7 +76,11 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
                     self::allowUnsafeDrivers($config),
                 );
 
-                return ContainerBindings::makeLlmClient($config);
+                return ContainerBindings::makeLlmClient(
+                    $config,
+                    $app->bound(Metrics::class) ? $app->make(Metrics::class) : null,
+                    $app->bound(Tracer::class) ? $app->make(Tracer::class) : null,
+                );
             });
         }
 
@@ -151,6 +159,7 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
                 $app->make(CapabilityBus::class),
                 $app->make(IdempotencyReadiness::class),
                 is_string($userModel) && $userModel !== '' ? $userModel : null,
+                self::optional($app, ToolCatalog::class),
             );
         });
     }
@@ -313,6 +322,31 @@ final class CapabilitiesAiServiceProvider extends ServiceProvider
             '1', 'true', '(true)', 'yes', 'on' => true,
             default => false,
         };
+    }
+
+    /**
+     * Fail closed at boot when bus invokes are possible but the actor model is unusable.
+     * Class + query() check only; no database access.
+     */
+    private function assertConversationActorModel(): void
+    {
+        if (! $this->app->bound(CapabilityBus::class)) {
+            return;
+        }
+
+        $config = $this->app->make('config');
+        $model = null;
+        if (is_object($config) && method_exists($config, 'get')) {
+            foreach (['capabilities-ai.user_model', 'auth.providers.users.model'] as $key) {
+                $value = $config->get($key);
+                if (is_string($value) && $value !== '') {
+                    $model = $value;
+                    break;
+                }
+            }
+        }
+
+        ResolveConversationActor::assertQueryableModel($model);
     }
 
     private function bootRoutes(): void
